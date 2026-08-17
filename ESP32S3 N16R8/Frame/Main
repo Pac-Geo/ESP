@@ -1,0 +1,43 @@
+//ESP32S3 N16R8 Test
+//
+//PURPOSE
+//System starts OFF
+//One normal button press → ON.
+//ON for 3 seconds → then OFF.
+//while OFF does nothing.
+//V1
+
+#include <Arduino.h>
+
+#define BUTTON_PIN 21
+#define RGB_LED_PIN 48
+
+void setup() {
+  pinMode(BUTTON_PIN, INPUT);
+
+  // Make sure LED starts off
+  rgbLedWrite(RGB_LED_PIN, 0, 0, 0);
+}
+
+void loop() {
+
+  if (digitalRead(BUTTON_PIN) == LOW) {
+
+    // Turn onboard LED white
+    rgbLedWrite(RGB_LED_PIN, 255, 255, 255);
+
+    // Keep it on for 2 seconds
+    delay(2000);
+
+    // Turn LED off
+    rgbLedWrite(RGB_LED_PIN, 0, 0, 0);
+
+    // Wait until button is released
+    while (digitalRead(BUTTON_PIN) == LOW) {
+      delay(10);
+    }
+
+    // Simple debounce
+    delay(50);
+  }
+}
