@@ -1,0 +1,927 @@
+/*
+  ================================================================
+  ESP32-S3 PHOTO FRAME
+  POWER + AMG8833 SLEEP/WAKE + OLED DISPLAY TEST
+  ================================================================
+
+  WIRING
+  ------------------------------------------------
+  GPIO15  <- AMG8833 INT
+  GPIO16  -> Relay IN
+
+  GPIO17  -> I2C SDA
+             ├── AMG8833 SDA
+             └── OLED SDA
+
+  GPIO18  -> I2C SCL
+             ├── AMG8833 SCL
+             └── OLED SCL
+
+  GPIO21  <- Power button to GND
+
+
+  ================================================================
+  POWER BUTTON
+  ================================================================
+
+  Hold button for 3 seconds:
+
+      Relay OFF
+      OLED OFF
+      System OFF
+      ESP deep sleep
+
+  AMG8833 CANNOT wake from manual OFF.
+
+  Only a NEW button press turns system back ON.
+
+
+  ================================================================
+  SENSOR / DISPLAY SLEEP
+  ================================================================
+
+  While system is ON:
+
+      Person detected
+          -> display remains awake
+          -> inactivity timer resets
+
+      No person for 30 seconds
+          -> OLED turns OFF
+          -> relay STAYS ON
+          -> ESP enters deep sleep
+          -> AMG8833 INT can wake ESP
+
+      AMG8833 INT
+          -> ESP wakes
+          -> OLED turns back ON
+          -> display resumes
+
+
+  ================================================================
+  VALUES TO CHANGE LATER
+  ================================================================
+
+  BUTTON_HOLD_TIME
+      3000 = 3 seconds
+
+
+  INACTIVITY_TIME
+
+      TEST:
+          30000 = 30 seconds
+
+      FINAL 30 MINUTES:
+
+          30UL * 60UL * 1000UL
+
+
+  PERSON_TEMP_THRESHOLD
+
+      Current:
+          28.0 C
+
+      Adjust after testing actual room conditions.
+
+
+  AMG_INTERRUPT_HIGH
+
+      Current:
+          28.0 C
+
+      Thermal threshold that causes AMG8833 INT.
+
+
+  OLED_ADDRESS
+
+      Usually:
+          0x3C
+
+      Some OLED modules use:
+          0x3D
+
+
+  ================================================================
+  FUTURE PHOTO FRAME
+  ================================================================
+
+  displayPhotos()
+
+  currently draws a test picture on the OLED.
+
+  Eventually this function represents:
+
+      USB photo
+          ->
+      decode image
+          ->
+      VGA framebuffer
+          ->
+      monitor
+
+  sleepDisplay()
+
+  will eventually stop LCD_CAM / VGA generation.
+
+  wakeDisplay()
+
+  will eventually restart LCD_CAM / VGA generation.
+
+  ================================================================
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+
+#include <Adafruit_AMG88xx.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#include "esp_sleep.h"
+#include "driver/gpio.h"
+
+
+// ================================================================
+// PINS
+// ================================================================
+
+const gpio_num_t AMG_INT_PIN = GPIO_NUM_15;
+const gpio_num_t RELAY_PIN   = GPIO_NUM_16;
+const gpio_num_t BUTTON_PIN  = GPIO_NUM_21;
+
+const int SDA_PIN = 17;
+const int SCL_PIN = 18;
+
+
+// ================================================================
+// USER SETTINGS
+// ================================================================
+
+const unsigned long BUTTON_HOLD_TIME = 3000;
+
+
+// TEST: 30 seconds
+const unsigned long INACTIVITY_TIME = 30000;
+
+
+// FINAL 30 MINUTES:
+//
+// const unsigned long INACTIVITY_TIME =
+//     30UL * 60UL * 1000UL;
+
+
+const float PERSON_TEMP_THRESHOLD = 28.0;
+
+const float AMG_INTERRUPT_HIGH = 28.0;
+const float AMG_INTERRUPT_LOW  = 0.0;
+const float AMG_HYSTERESIS     = 27.0;
+
+
+// ================================================================
+// OLED
+// ================================================================
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+const uint8_t OLED_ADDRESS = 0x3C;
+
+Adafruit_SSD1306 display(
+  SCREEN_WIDTH,
+  SCREEN_HEIGHT,
+  &Wire,
+  -1
+);
+
+
+// ================================================================
+// RELAY
+// ================================================================
+
+const int RELAY_ON  = HIGH;
+const int RELAY_OFF = LOW;
+
+
+// ================================================================
+// AMG8833
+// ================================================================
+
+Adafruit_AMG88xx amg;
+
+float pixels[64];
+
+
+// ================================================================
+// SYSTEM STATE
+// ================================================================
+
+RTC_DATA_ATTR bool systemOn = false;
+
+unsigned long lastPersonTime = 0;
+
+bool previousButton = HIGH;
+unsigned long buttonPressStart = 0;
+
+
+// ================================================================
+// RELAY
+// ================================================================
+
+void setRelay(bool state)
+{
+  digitalWrite(
+    RELAY_PIN,
+    state ? RELAY_ON : RELAY_OFF
+  );
+
+  Serial.print("Relay: ");
+  Serial.println(state ? "ON" : "OFF");
+}
+
+
+// ================================================================
+// DISPLAY TEST
+//
+// THIS REPRESENTS THE FUTURE PHOTO DISPLAY FUNCTION.
+// ================================================================
+
+void displayPhotos()
+{
+  display.ssd1306_command(SSD1306_DISPLAYON);
+
+  display.clearDisplay();
+
+  // --------------------------------------------------------------
+  // Draw a simple fake "photo"
+  // --------------------------------------------------------------
+
+  // Border
+  display.drawRect(
+    0,
+    0,
+    SCREEN_WIDTH,
+    SCREEN_HEIGHT,
+    SSD1306_WHITE
+  );
+
+  // Mountains
+  display.drawTriangle(
+    5, 52,
+    35, 20,
+    65, 52,
+    SSD1306_WHITE
+  );
+
+  display.drawTriangle(
+    42, 52,
+    82, 14,
+    122, 52,
+    SSD1306_WHITE
+  );
+
+  // Sun
+  display.fillCircle(
+    103,
+    14,
+    6,
+    SSD1306_WHITE
+  );
+
+  // Ground
+  display.drawLine(
+    5,
+    53,
+    122,
+    53,
+    SSD1306_WHITE
+  );
+
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(7, 56);
+  display.print("PHOTO FRAME AWAKE");
+
+  display.display();
+}
+
+
+// ================================================================
+// TURN DISPLAY OFF
+//
+// Later this is where VGA/LCD_CAM will stop.
+// ================================================================
+
+void sleepDisplay()
+{
+  Serial.println("DISPLAY OFF");
+
+  display.clearDisplay();
+  display.display();
+
+  display.ssd1306_command(
+    SSD1306_DISPLAYOFF
+  );
+}
+
+
+// ================================================================
+// WAKE DISPLAY
+//
+// Later this is where VGA/LCD_CAM will restart.
+// ================================================================
+
+void wakeDisplay()
+{
+  Serial.println("DISPLAY ON");
+
+  display.ssd1306_command(
+    SSD1306_DISPLAYON
+  );
+
+  displayPhotos();
+}
+
+
+// ================================================================
+// HOLD RELAY DURING DEEP SLEEP
+// ================================================================
+
+void holdRelay()
+{
+  gpio_hold_en(RELAY_PIN);
+  gpio_deep_sleep_hold_en();
+}
+
+
+// ================================================================
+// RESTORE RELAY
+// ================================================================
+
+void restoreRelay(bool state)
+{
+  pinMode(RELAY_PIN, OUTPUT);
+
+  digitalWrite(
+    RELAY_PIN,
+    state ? RELAY_ON : RELAY_OFF
+  );
+
+  gpio_hold_dis(RELAY_PIN);
+  gpio_deep_sleep_hold_dis();
+}
+
+
+// ================================================================
+// WAIT FOR BUTTON RELEASE
+// ================================================================
+
+void waitForButtonRelease()
+{
+  while (
+    digitalRead(BUTTON_PIN) == LOW
+  )
+  {
+    delay(10);
+  }
+
+  delay(100);
+}
+
+
+// ================================================================
+// FULL POWER OFF
+//
+// BUTTON FUNCTION ONLY.
+// ================================================================
+
+void fullPowerOff()
+{
+  Serial.println();
+  Serial.println("========================");
+  Serial.println("MANUAL POWER OFF");
+  Serial.println("========================");
+
+  systemOn = false;
+
+
+  // Display OFF
+  sleepDisplay();
+
+
+  // Monitor power OFF
+  setRelay(false);
+
+
+  // Keep relay OFF during sleep
+  holdRelay();
+
+
+  // Current button press must finish first
+  waitForButtonRelease();
+
+
+  // Disable all old wake sources
+  esp_sleep_disable_wakeup_source(
+    ESP_SLEEP_WAKEUP_ALL
+  );
+
+
+  // ONLY BUTTON CAN WAKE
+  esp_sleep_enable_ext1_wakeup(
+    (1ULL << BUTTON_PIN),
+    ESP_EXT1_WAKEUP_ANY_LOW
+  );
+
+
+  Serial.println("SYSTEM OFF");
+  Serial.println("Relay OFF");
+  Serial.println("Display OFF");
+  Serial.println("AMG wake disabled");
+  Serial.println("Press button to turn ON");
+
+  Serial.flush();
+
+  esp_deep_sleep_start();
+}
+
+
+// ================================================================
+// SENSOR INACTIVITY SLEEP
+// ================================================================
+
+void sensorSleep()
+{
+  Serial.println();
+  Serial.println("========================");
+  Serial.println("SENSOR SLEEP");
+  Serial.println("========================");
+
+
+  // --------------------------------------------------------------
+  // DISPLAY GOES OFF
+  // --------------------------------------------------------------
+
+  sleepDisplay();
+
+
+  // --------------------------------------------------------------
+  // RELAY DOES NOT GO OFF
+  // --------------------------------------------------------------
+
+  setRelay(true);
+
+  holdRelay();
+
+
+  Serial.println("Relay remains ON");
+  Serial.println("Display OFF");
+  Serial.println("ESP entering deep sleep");
+
+
+  // --------------------------------------------------------------
+  // CLEAR OLD AMG INTERRUPT
+  // --------------------------------------------------------------
+
+  amg.clearInterrupt();
+
+  delay(50);
+
+
+  // --------------------------------------------------------------
+  // CONFIGURE WAKE
+  // --------------------------------------------------------------
+
+  esp_sleep_disable_wakeup_source(
+    ESP_SLEEP_WAKEUP_ALL
+  );
+
+
+  uint64_t wakeMask =
+      (1ULL << AMG_INT_PIN)
+    | (1ULL << BUTTON_PIN);
+
+
+  esp_sleep_enable_ext1_wakeup(
+    wakeMask,
+    ESP_EXT1_WAKEUP_ANY_LOW
+  );
+
+
+  Serial.println(
+    "Waiting for thermal wake..."
+  );
+
+  Serial.flush();
+
+  delay(100);
+
+  esp_deep_sleep_start();
+}
+
+
+// ================================================================
+// BUTTON
+// ================================================================
+
+void handlePowerButton()
+{
+  bool button =
+      digitalRead(BUTTON_PIN);
+
+
+  // New press
+  if (
+    button == LOW &&
+    previousButton == HIGH
+  )
+  {
+    buttonPressStart = millis();
+
+    Serial.println(
+      "Power button pressed"
+    );
+  }
+
+
+  // Hold 3 seconds
+  if (
+    systemOn &&
+    button == LOW
+  )
+  {
+    if (
+      millis() - buttonPressStart
+      >= BUTTON_HOLD_TIME
+    )
+    {
+      Serial.println(
+        "3-second hold detected"
+      );
+
+      // Never returns
+      fullPowerOff();
+    }
+  }
+
+
+  previousButton = button;
+}
+
+
+// ================================================================
+// AMG8833 SETUP
+// ================================================================
+
+bool setupAMG()
+{
+  if (!amg.begin())
+  {
+    Serial.println(
+      "ERROR: AMG8833 not detected"
+    );
+
+    return false;
+  }
+
+
+  pinMode(
+    AMG_INT_PIN,
+    INPUT_PULLUP
+  );
+
+
+  amg.setInterruptMode(
+    AMG88xx_ABSOLUTE_VALUE
+  );
+
+
+  amg.setInterruptLevels(
+    AMG_INTERRUPT_HIGH,
+    AMG_INTERRUPT_LOW,
+    AMG_HYSTERESIS
+  );
+
+
+  amg.clearInterrupt();
+
+  amg.enableInterrupt();
+
+
+  Serial.println(
+    "AMG8833 ready"
+  );
+
+  return true;
+}
+
+
+// ================================================================
+// OLED SETUP
+// ================================================================
+
+bool setupOLED()
+{
+  if (
+    !display.begin(
+      SSD1306_SWITCHCAPVCC,
+      OLED_ADDRESS
+    )
+  )
+  {
+    Serial.println(
+      "ERROR: OLED not detected"
+    );
+
+    return false;
+  }
+
+
+  display.clearDisplay();
+  display.display();
+
+
+  Serial.println(
+    "OLED ready"
+  );
+
+  return true;
+}
+
+
+// ================================================================
+// PERSON DETECTION
+// ================================================================
+
+bool detectPerson()
+{
+  amg.readPixels(pixels);
+
+
+  float hottest = pixels[0];
+
+
+  for (int i = 1; i < 64; i++)
+  {
+    if (pixels[i] > hottest)
+    {
+      hottest = pixels[i];
+    }
+  }
+
+
+  Serial.print("Hottest: ");
+  Serial.print(hottest, 1);
+  Serial.print(" C");
+
+
+  if (
+    hottest >= PERSON_TEMP_THRESHOLD
+  )
+  {
+    Serial.println(
+      "  PERSON DETECTED"
+    );
+
+    return true;
+  }
+
+
+  Serial.println(
+    "  no person"
+  );
+
+  return false;
+}
+
+
+// ================================================================
+// GET WAKE PINS
+// ================================================================
+
+uint64_t getWakePins()
+{
+  if (
+    esp_sleep_get_wakeup_cause()
+    == ESP_SLEEP_WAKEUP_EXT1
+  )
+  {
+    return
+      esp_sleep_get_ext1_wakeup_status();
+  }
+
+  return 0;
+}
+
+
+// ================================================================
+// SETUP
+// ================================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  delay(400);
+
+
+  pinMode(
+    BUTTON_PIN,
+    INPUT_PULLUP
+  );
+
+
+  // --------------------------------------------------------------
+  // START SHARED I2C BUS
+  // --------------------------------------------------------------
+
+  Wire.begin(
+    SDA_PIN,
+    SCL_PIN
+  );
+
+
+  uint64_t wakePins =
+      getWakePins();
+
+
+  Serial.println();
+  Serial.println("========================");
+  Serial.println("PHOTO FRAME TEST");
+  Serial.println("========================");
+
+
+  // ==============================================================
+  // BUTTON WOKE MANUALLY-OFF SYSTEM
+  // ==============================================================
+
+  if (
+    !systemOn &&
+    (wakePins & (1ULL << BUTTON_PIN))
+  )
+  {
+    systemOn = true;
+
+    Serial.println(
+      "POWER BUTTON WAKE"
+    );
+  }
+
+
+  // ==============================================================
+  // RESTORE RELAY
+  // ==============================================================
+
+  if (systemOn)
+  {
+    restoreRelay(true);
+
+    setRelay(true);
+  }
+  else
+  {
+    restoreRelay(false);
+
+    setRelay(false);
+  }
+
+
+  // ==============================================================
+  // MANUALLY OFF
+  // ==============================================================
+
+  if (!systemOn)
+  {
+    Serial.println("SYSTEM OFF");
+
+
+    if (
+      digitalRead(BUTTON_PIN) == LOW
+    )
+    {
+      waitForButtonRelease();
+    }
+
+
+    holdRelay();
+
+
+    esp_sleep_disable_wakeup_source(
+      ESP_SLEEP_WAKEUP_ALL
+    );
+
+
+    esp_sleep_enable_ext1_wakeup(
+      (1ULL << BUTTON_PIN),
+      ESP_EXT1_WAKEUP_ANY_LOW
+    );
+
+
+    Serial.println(
+      "Press button to turn ON"
+    );
+
+    Serial.flush();
+
+    esp_deep_sleep_start();
+  }
+
+
+  // ==============================================================
+  // SYSTEM ON
+  // ==============================================================
+
+  if (!setupAMG())
+  {
+    while (true)
+    {
+      delay(1000);
+    }
+  }
+
+
+  if (!setupOLED())
+  {
+    while (true)
+    {
+      delay(1000);
+    }
+  }
+
+
+  // ==============================================================
+  // SHOW WHY WE WOKE
+  // ==============================================================
+
+  if (
+    wakePins &
+    (1ULL << AMG_INT_PIN)
+  )
+  {
+    Serial.println();
+    Serial.println(
+      "THERMAL SENSOR WAKE"
+    );
+  }
+
+
+  // ==============================================================
+  // DISPLAY AWAKE
+  // ==============================================================
+
+  wakeDisplay();
+
+
+  Serial.println();
+  Serial.println("SYSTEM AWAKE");
+
+
+  // Start fresh inactivity timer
+  lastPersonTime = millis();
+}
+
+
+// ================================================================
+// LOOP
+// ================================================================
+
+void loop()
+{
+  // ==============================================================
+  // PRIORITY #1:
+  // POWER BUTTON
+  // ==============================================================
+
+  handlePowerButton();
+
+
+  // ==============================================================
+  // PRESENCE
+  // ==============================================================
+
+  if (detectPerson())
+  {
+    lastPersonTime = millis();
+  }
+
+
+  // ==============================================================
+  // INACTIVITY
+  // ==============================================================
+
+  if (
+    millis() - lastPersonTime
+    >= INACTIVITY_TIME
+  )
+  {
+    Serial.println();
+    Serial.println(
+      "30 seconds without person"
+    );
+
+    sensorSleep();
+  }
+
+
+  delay(100);
+}
