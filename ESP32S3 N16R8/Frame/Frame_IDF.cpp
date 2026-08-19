@@ -203,6 +203,8 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <stdio.h>
+#include <errno.h>
+#include <string.h>
 
 #include "usb/msc_host.h"
 #include "usb/msc_host_vfs.h"
@@ -1028,22 +1030,96 @@ void listUSBFiles()
 
 bool writeUSBTestFile()
 {
-  const char *path = USB_MOUNT_POINT "/FRAME_TEST.txt";
+  const char *path = USB_MOUNT_POINT "/TEST.txt";
+
   Serial.println("\nCreating FRAME_TEST.txt...");
+
+  errno = 0;
+
   FILE *file = fopen(path, "w");
-  if (!file) {
+
+  if (!file)
+  {
+    int errnum = errno;
+
     Serial.println("ERROR: Could not create FRAME_TEST.txt");
+
+    Serial.print("Path: ");
+    Serial.println(path);
+
+    Serial.print("errno: ");
+    Serial.println(errnum);
+
+    Serial.print("reason: ");
+    Serial.println(strerror(errnum));
+
     return false;
   }
-  fprintf(file, "ESP32-S3 PHOTO FRAME USB TEST\nUSB mass storage is working.\n");
-  fclose(file);
-  Serial.println("Write successful");
+
+  int written = fprintf(
+    file,
+    "ESP32-S3 PHOTO FRAME USB TEST\n"
+    "USB mass storage is working.\n"
+  );
+
+  if (written < 0)
+  {
+    int errnum = errno;
+
+    Serial.println("ERROR: fprintf() failed");
+
+    Serial.print("errno: ");
+    Serial.println(errnum);
+
+    Serial.print("reason: ");
+    Serial.println(strerror(errnum));
+
+    fclose(file);
+
+    return false;
+  }
+
+  if (fflush(file) != 0)
+  {
+    int errnum = errno;
+
+    Serial.println("ERROR: fflush() failed");
+
+    Serial.print("errno: ");
+    Serial.println(errnum);
+
+    Serial.print("reason: ");
+    Serial.println(strerror(errnum));
+
+    fclose(file);
+
+    return false;
+  }
+
+  if (fclose(file) != 0)
+  {
+    int errnum = errno;
+
+    Serial.println("ERROR: fclose() failed");
+
+    Serial.print("errno: ");
+    Serial.println(errnum);
+
+    Serial.print("reason: ");
+    Serial.println(strerror(errnum));
+
+    return false;
+  }
+
+  Serial.print("Write successful, bytes written: ");
+  Serial.println(written);
+
   return true;
 }
 
 bool readUSBTestFile()
 {
-  const char *path = USB_MOUNT_POINT "/FRAME_TEST.txt";
+  const char *path = USB_MOUNT_POINT "/TEST.txt";
   Serial.println("\nReading FRAME_TEST.txt:");
   Serial.println("------------------------");
   FILE *file = fopen(path, "r");
