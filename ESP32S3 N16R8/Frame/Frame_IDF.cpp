@@ -88,16 +88,22 @@
           ->
       OLED shows "USB"
 
-  THIS VERSION TESTS USB MASS STORAGE + FAT FILE ACCESS.
+  THIS VERSION TESTS USB MASS STORAGE + FAT LFN + CHUNKED DRIVE SYNC.
 
-  It does NOT yet:
+  USB STORAGE:
+      - mounts FAT32
+      - uses FAT long filenames (LFN must be enabled in sdkconfig)
+      - lists files
+      - writes/reads a long-name test file
 
-      - mount FAT32
-      - list files
-      - create files
-      - download Google Drive photos
-
-  Those are the next USB steps after enumeration succeeds.
+  DRIVE SYNC:
+      - gets the Drive photo list from Apps Script
+      - downloads only missing JPEG/PNG files
+      - streams in 64 KiB chunks
+      - supports files up to 100 MiB
+      - writes to DOWNLOAD.TMP first
+      - verifies byte count
+      - renames to the final long filename only after success
 
 
   ==================================================================
@@ -189,6 +195,9 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 
 #include <Adafruit_AMG88xx.h>
 #include <Adafruit_GFX.h>
@@ -209,6 +218,7 @@
 #include "usb/msc_host.h"
 #include "usb/msc_host_vfs.h"
 #include "esp_vfs_fat.h"
+#include "mbedtls/base64.h"
 // ==================================================================
 // PIN ASSIGNMENTS
 // ==================================================================
@@ -234,6 +244,37 @@ const int SCL_PIN = 18;
 // ==================================================================
 
 const unsigned long BUTTON_HOLD_TIME = 3000;
+
+
+// ------------------------------------------------------------------
+// WIFI + GOOGLE DRIVE BRIDGE
+//
+// Fill these in before testing Drive synchronization.
+// ------------------------------------------------------------------
+
+const char *WIFI_SSID = "Palomec";
+const char *WIFI_PASSWORD = "Getstarted";
+
+// Current Apps Script deployment URL.
+const char *APPS_SCRIPT_URL =
+  "https://script.google.com/macros/s/"
+  "AKfycbwtlhKjaVmti-3wV93wjcWWrSzJoCef7aNbnv91G8qQ1PXZcp5p0gHhdbdXD44aXakt3Q/"
+  "exec";
+
+const char *APPS_SCRIPT_TOKEN =
+  "facildeconectar";
+
+// Raw bytes per Drive request.
+// 64 KiB keeps ESP RAM use bounded while still supporting very large files.
+const size_t DOWNLOAD_CHUNK_SIZE = 64 * 1024;
+
+// Policy limit only.  The whole file is NEVER stored in ESP RAM.
+const uint64_t MAX_PHOTO_SIZE =
+  100ULL * 1024ULL * 1024ULL;   // 100 MiB
+
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000;
+const unsigned long HTTP_TIMEOUT_MS = 10000;
+const int DOWNLOAD_RETRIES = 3;
 
 
 // TEST: 30 seconds
@@ -301,6 +342,11 @@ static msc_host_vfs_handle_t mscVfs = NULL;
 volatile bool usbDeviceConnected = false;
 volatile bool usbStatusChanged = false;
 static QueueHandle_t usbEventQueue = NULL;
+
+volatile bool usbTransferActive = false;
+volatile bool abortUsbTransfer = false;
+
+static uint8_t downloadDecodeBuffer[DOWNLOAD_CHUNK_SIZE + 4];
 
 enum UsbEventType { USB_DEVICE_CONNECTED, USB_DEVICE_DISCONNECTED };
 struct UsbEvent { UsbEventType type; uint8_t address; };
@@ -575,6 +621,19 @@ void waitForButtonRelease()
 
 void fullPowerOff()
 {
+  // Manual power button remains highest priority.
+  // Ask any Drive transfer to stop before entering deep sleep.
+  abortUsbTransfer = true;
+
+  unsigned long abortWaitStarted = millis();
+
+  while (
+    usbTransferActive &&
+    millis() - abortWaitStarted < 6000
+  )
+  {
+    delay(20);
+  }
   Serial.println();
 
   Serial.println(
@@ -1030,9 +1089,9 @@ void listUSBFiles()
 
 bool writeUSBTestFile()
 {
-  const char *path = USB_MOUNT_POINT "/TEST.txt";
+  const char *path = USB_MOUNT_POINT "/THIS_IS_A_LONG_FILENAME_TEST.txt";
 
-  Serial.println("\nCreating FRAME_TEST.txt...");
+  Serial.println("\nCreating long filename test...");
 
   errno = 0;
 
@@ -1042,7 +1101,7 @@ bool writeUSBTestFile()
   {
     int errnum = errno;
 
-    Serial.println("ERROR: Could not create FRAME_TEST.txt");
+    Serial.println("ERROR: Could not create long filename test file");
 
     Serial.print("Path: ");
     Serial.println(path);
@@ -1119,12 +1178,12 @@ bool writeUSBTestFile()
 
 bool readUSBTestFile()
 {
-  const char *path = USB_MOUNT_POINT "/TEST.txt";
-  Serial.println("\nReading FRAME_TEST.txt:");
+  const char *path = USB_MOUNT_POINT "/THIS_IS_A_LONG_FILENAME_TEST.txt";
+  Serial.println("\nReading long filename test:");
   Serial.println("------------------------");
   FILE *file = fopen(path, "r");
   if (!file) {
-    Serial.println("ERROR: Could not open FRAME_TEST.txt");
+    Serial.println("ERROR: Could not open long filename test file");
     return false;
   }
   char buffer[128];
@@ -1133,6 +1192,1013 @@ bool readUSBTestFile()
   Serial.println("------------------------");
   return true;
 }
+
+
+// ==================================================================
+// WIFI + DRIVE CHUNKED DOWNLOAD
+// ==================================================================
+
+struct DrivePhoto
+{
+  String id;
+  String name;
+  String mimeType;
+  uint64_t size;
+};
+
+const int MAX_DRIVE_PHOTOS = 128;
+
+
+// ------------------------------------------------------------------
+// URL ENCODING
+// ------------------------------------------------------------------
+
+String urlEncode(const String &input)
+{
+  const char hex[] = "0123456789ABCDEF";
+  String out;
+  out.reserve(input.length() * 3);
+
+  for (size_t i = 0; i < input.length(); i++)
+  {
+    uint8_t c = (uint8_t)input[i];
+
+    if (
+      (c >= 'a' && c <= 'z') ||
+      (c >= 'A' && c <= 'Z') ||
+      (c >= '0' && c <= '9') ||
+      c == '-' || c == '_' || c == '.' || c == '~'
+    )
+    {
+      out += (char)c;
+    }
+    else
+    {
+      out += '%';
+      out += hex[(c >> 4) & 0x0F];
+      out += hex[c & 0x0F];
+    }
+  }
+
+  return out;
+}
+
+
+// ------------------------------------------------------------------
+// VERY SMALL JSON FIELD HELPERS
+//
+// These are intentionally limited to the predictable JSON returned by
+// our own Apps Script bridge, so no additional JSON library is needed.
+// ------------------------------------------------------------------
+
+bool jsonStringField(
+  const String &json,
+  const char *key,
+  String &value
+)
+{
+  String pattern = "\"";
+  pattern += key;
+  pattern += "\"";
+
+  int p = json.indexOf(pattern);
+
+  if (p < 0)
+  {
+    return false;
+  }
+
+  p = json.indexOf(':', p + pattern.length());
+
+  if (p < 0)
+  {
+    return false;
+  }
+
+  p++;
+
+  while (p < (int)json.length() && isspace((unsigned char)json[p]))
+  {
+    p++;
+  }
+
+  if (p >= (int)json.length() || json[p] != '"')
+  {
+    return false;
+  }
+
+  p++;
+
+  value = "";
+
+  while (p < (int)json.length())
+  {
+    char c = json[p++];
+
+    if (c == '"')
+    {
+      return true;
+    }
+
+    if (c == '\\' && p < (int)json.length())
+    {
+      char esc = json[p++];
+
+      switch (esc)
+      {
+        case '"': value += '"'; break;
+        case '\\': value += '\\'; break;
+        case '/': value += '/'; break;
+        case 'b': value += '\b'; break;
+        case 'f': value += '\f'; break;
+        case 'n': value += '\n'; break;
+        case 'r': value += '\r'; break;
+        case 't': value += '\t'; break;
+
+        // Keep uncommon \uXXXX sequences harmless for now.
+        // Typical camera filenames are ASCII.
+        case 'u':
+          value += '_';
+
+          for (int i = 0; i < 4 && p < (int)json.length(); i++)
+          {
+            p++;
+          }
+          break;
+
+        default:
+          value += esc;
+          break;
+      }
+    }
+    else
+    {
+      value += c;
+    }
+  }
+
+  return false;
+}
+
+
+bool jsonUInt64Field(
+  const String &json,
+  const char *key,
+  uint64_t &value
+)
+{
+  String pattern = "\"";
+  pattern += key;
+  pattern += "\"";
+
+  int p = json.indexOf(pattern);
+
+  if (p < 0)
+  {
+    return false;
+  }
+
+  p = json.indexOf(':', p + pattern.length());
+
+  if (p < 0)
+  {
+    return false;
+  }
+
+  p++;
+
+  while (p < (int)json.length() && isspace((unsigned char)json[p]))
+  {
+    p++;
+  }
+
+  bool quoted = false;
+
+  if (p < (int)json.length() && json[p] == '"')
+  {
+    quoted = true;
+    p++;
+  }
+
+  uint64_t result = 0;
+  bool foundDigit = false;
+
+  while (p < (int)json.length())
+  {
+    char c = json[p];
+
+    if (c < '0' || c > '9')
+    {
+      break;
+    }
+
+    foundDigit = true;
+    result = result * 10ULL + (uint64_t)(c - '0');
+    p++;
+  }
+
+  if (!foundDigit)
+  {
+    return false;
+  }
+
+  if (quoted && p < (int)json.length() && json[p] != '"')
+  {
+    return false;
+  }
+
+  value = result;
+
+  return true;
+}
+
+
+// ------------------------------------------------------------------
+// WIFI
+// ------------------------------------------------------------------
+
+bool wifiSettingsConfigured()
+{
+  return
+    String(WIFI_SSID) != "PUT_YOUR_WIFI_SSID_HERE" &&
+    String(WIFI_PASSWORD) != "PUT_YOUR_WIFI_PASSWORD_HERE" &&
+    String(APPS_SCRIPT_TOKEN) != "PUT_YOUR_EXISTING_SECRET_TOKEN_HERE";
+}
+
+
+bool ensureWiFi()
+{
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    return true;
+  }
+
+  if (!wifiSettingsConfigured())
+  {
+    Serial.println();
+    Serial.println("WiFi/Apps Script credentials not configured.");
+    Serial.println("USB storage will still work; Drive sync skipped.");
+
+    return false;
+  }
+
+  Serial.println();
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long started = millis();
+
+  while (
+    WiFi.status() != WL_CONNECTED &&
+    millis() - started < WIFI_CONNECT_TIMEOUT_MS
+  )
+  {
+    handlePowerButton();
+    delay(100);
+  }
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("WiFi connection failed.");
+
+    return false;
+  }
+
+  Serial.print("WiFi connected. IP: ");
+  Serial.println(WiFi.localIP());
+
+  return true;
+}
+
+
+// ------------------------------------------------------------------
+// HTTP GET
+//
+// TLS certificate verification is disabled for this prototype.
+// Before final deployment we should install Google's trusted root CA.
+// ------------------------------------------------------------------
+
+bool httpsGetString(
+  const String &url,
+  String &responseBody
+)
+{
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.setTimeout(HTTP_TIMEOUT_MS);
+
+  if (!http.begin(client, url))
+  {
+    Serial.println("HTTP begin failed.");
+
+    return false;
+  }
+
+  int code = http.GET();
+
+  if (code != HTTP_CODE_OK)
+  {
+    Serial.print("HTTP GET failed. Code: ");
+    Serial.println(code);
+
+    responseBody = http.getString();
+
+    if (responseBody.length())
+    {
+      Serial.println(responseBody);
+    }
+
+    http.end();
+
+    return false;
+  }
+
+  responseBody = http.getString();
+
+  http.end();
+
+  return true;
+}
+
+
+// ------------------------------------------------------------------
+// READ DRIVE PHOTO LIST
+// ------------------------------------------------------------------
+
+int parseDrivePhotoList(
+  const String &json,
+  DrivePhoto photos[],
+  int maxPhotos
+)
+{
+  int photosPos = json.indexOf("\"photos\"");
+
+  if (photosPos < 0)
+  {
+    return 0;
+  }
+
+  int arrayStart = json.indexOf('[', photosPos);
+
+  if (arrayStart < 0)
+  {
+    return 0;
+  }
+
+  int p = arrayStart + 1;
+  int count = 0;
+
+  while (p < (int)json.length() && count < maxPhotos)
+  {
+    int objectStart = json.indexOf('{', p);
+
+    if (objectStart < 0)
+    {
+      break;
+    }
+
+    bool inString = false;
+    bool escaped = false;
+    int depth = 0;
+    int objectEnd = -1;
+
+    for (int i = objectStart; i < (int)json.length(); i++)
+    {
+      char c = json[i];
+
+      if (inString)
+      {
+        if (escaped)
+        {
+          escaped = false;
+        }
+        else if (c == '\\')
+        {
+          escaped = true;
+        }
+        else if (c == '"')
+        {
+          inString = false;
+        }
+
+        continue;
+      }
+
+      if (c == '"')
+      {
+        inString = true;
+      }
+      else if (c == '{')
+      {
+        depth++;
+      }
+      else if (c == '}')
+      {
+        depth--;
+
+        if (depth == 0)
+        {
+          objectEnd = i;
+          break;
+        }
+      }
+    }
+
+    if (objectEnd < 0)
+    {
+      break;
+    }
+
+    String objectJson =
+      json.substring(objectStart, objectEnd + 1);
+
+    DrivePhoto photo;
+
+    if (
+      jsonStringField(objectJson, "id", photo.id) &&
+      jsonStringField(objectJson, "name", photo.name) &&
+      jsonStringField(objectJson, "mimeType", photo.mimeType) &&
+      jsonUInt64Field(objectJson, "size", photo.size)
+    )
+    {
+      photos[count++] = photo;
+    }
+
+    p = objectEnd + 1;
+  }
+
+  return count;
+}
+
+
+bool fetchDrivePhotoList(
+  DrivePhoto photos[],
+  int &photoCount
+)
+{
+  photoCount = 0;
+
+  if (!ensureWiFi())
+  {
+    return false;
+  }
+
+  String url = APPS_SCRIPT_URL;
+  url += "?action=list&token=";
+  url += urlEncode(APPS_SCRIPT_TOKEN);
+
+  Serial.println();
+  Serial.println("Requesting Google Drive photo list...");
+
+  String body;
+
+  if (!httpsGetString(url, body))
+  {
+    Serial.println("Drive list request failed.");
+
+    return false;
+  }
+
+  if (body.indexOf("\"success\":true") < 0)
+  {
+    Serial.println("Drive list returned an error:");
+    Serial.println(body);
+
+    return false;
+  }
+
+  photoCount =
+    parseDrivePhotoList(
+      body,
+      photos,
+      MAX_DRIVE_PHOTOS
+    );
+
+  Serial.print("Drive photos parsed: ");
+  Serial.println(photoCount);
+
+  return true;
+}
+
+
+// ------------------------------------------------------------------
+// FAT-SAFE LONG FILENAME
+// ------------------------------------------------------------------
+
+String sanitizeFilename(const String &source)
+{
+  String out;
+  out.reserve(source.length());
+
+  for (size_t i = 0; i < source.length(); i++)
+  {
+    char c = source[i];
+
+    if (
+      c == '/' || c == '\\' || c == ':' || c == '*' ||
+      c == '?' || c == '"' || c == '<' || c == '>' ||
+      c == '|' || (uint8_t)c < 32
+    )
+    {
+      out += '_';
+    }
+    else
+    {
+      out += c;
+    }
+
+    // Keep plenty of room under FAT's 255-character LFN limit.
+    if (out.length() >= 220)
+    {
+      break;
+    }
+  }
+
+  out.trim();
+
+  if (out.length() == 0)
+  {
+    out = "UNNAMED.JPG";
+  }
+
+  return out;
+}
+
+
+bool ensurePhotosDirectory()
+{
+  const char *path = USB_MOUNT_POINT "/PHOTOS";
+
+  struct stat st;
+
+  if (stat(path, &st) == 0)
+  {
+    return S_ISDIR(st.st_mode);
+  }
+
+  if (mkdir(path, 0777) == 0)
+  {
+    Serial.println("Created /PHOTOS directory.");
+
+    return true;
+  }
+
+  Serial.print("Could not create /PHOTOS. errno=");
+  Serial.print(errno);
+  Serial.print(" ");
+  Serial.println(strerror(errno));
+
+  return false;
+}
+
+
+bool fileMatchesSize(
+  const String &path,
+  uint64_t expectedSize
+)
+{
+  struct stat st;
+
+  if (stat(path.c_str(), &st) != 0)
+  {
+    return false;
+  }
+
+  return
+    S_ISREG(st.st_mode) &&
+    (uint64_t)st.st_size == expectedSize;
+}
+
+
+// ------------------------------------------------------------------
+// GET ONE BASE64-ENCODED DRIVE RANGE
+// ------------------------------------------------------------------
+
+bool fetchDriveChunk(
+  const DrivePhoto &photo,
+  uint64_t offset,
+  size_t requestedLength,
+  size_t &decodedLength
+)
+{
+  decodedLength = 0;
+
+  String url = APPS_SCRIPT_URL;
+  url += "?action=chunk&id=";
+  url += urlEncode(photo.id);
+  url += "&offset=";
+  url += String((unsigned long long)offset);
+  url += "&length=";
+  url += String((unsigned long)requestedLength);
+  url += "&token=";
+  url += urlEncode(APPS_SCRIPT_TOKEN);
+
+  for (int attempt = 1; attempt <= DOWNLOAD_RETRIES; attempt++)
+  {
+    if (abortUsbTransfer)
+    {
+      return false;
+    }
+
+    String body;
+
+    if (!httpsGetString(url, body))
+    {
+      Serial.print("Chunk request retry ");
+      Serial.print(attempt);
+      Serial.print("/");
+      Serial.println(DOWNLOAD_RETRIES);
+
+      delay(250);
+
+      continue;
+    }
+
+    if (body.indexOf("\"success\":true") < 0)
+    {
+      Serial.println("Chunk endpoint returned an error:");
+      Serial.println(body);
+
+      delay(250);
+
+      continue;
+    }
+
+    String base64Data;
+    uint64_t returnedOffset = 0;
+    uint64_t rawLength = 0;
+
+    if (
+      !jsonStringField(body, "data", base64Data) ||
+      !jsonUInt64Field(body, "offset", returnedOffset) ||
+      !jsonUInt64Field(body, "length", rawLength)
+    )
+    {
+      Serial.println("Could not parse chunk response.");
+
+      delay(250);
+
+      continue;
+    }
+
+    if (returnedOffset != offset)
+    {
+      Serial.println("Chunk offset mismatch.");
+
+      delay(250);
+
+      continue;
+    }
+
+    size_t outputLength = 0;
+
+    int decodeResult =
+      mbedtls_base64_decode(
+        downloadDecodeBuffer,
+        sizeof(downloadDecodeBuffer),
+        &outputLength,
+        (const unsigned char *)base64Data.c_str(),
+        base64Data.length()
+      );
+
+    if (decodeResult != 0)
+    {
+      Serial.print("Base64 decode failed: ");
+      Serial.println(decodeResult);
+
+      delay(250);
+
+      continue;
+    }
+
+    if (outputLength != (size_t)rawLength)
+    {
+      Serial.println("Decoded chunk length mismatch.");
+
+      delay(250);
+
+      continue;
+    }
+
+    decodedLength = outputLength;
+
+    return true;
+  }
+
+  return false;
+}
+
+
+// ------------------------------------------------------------------
+// STREAM ONE PHOTO TO USB
+// ------------------------------------------------------------------
+
+bool downloadPhotoToUSB(const DrivePhoto &photo)
+{
+  if (
+    photo.mimeType != "image/jpeg" &&
+    photo.mimeType != "image/png"
+  )
+  {
+    return false;
+  }
+
+  if (photo.size == 0 || photo.size > MAX_PHOTO_SIZE)
+  {
+    Serial.print("Skipping size outside limit: ");
+    Serial.println(photo.name);
+
+    return false;
+  }
+
+  if (!ensurePhotosDirectory())
+  {
+    return false;
+  }
+
+  String safeName = sanitizeFilename(photo.name);
+
+  String finalPath = USB_MOUNT_POINT "/PHOTOS/";
+  finalPath += safeName;
+
+  if (fileMatchesSize(finalPath, photo.size))
+  {
+    Serial.print("Already on USB: ");
+    Serial.println(safeName);
+
+    return true;
+  }
+
+  const char *tempPath =
+    USB_MOUNT_POINT "/PHOTOS/DOWNLOAD.TMP";
+
+  remove(tempPath);
+
+  FILE *file = fopen(tempPath, "wb");
+
+  if (!file)
+  {
+    Serial.print("Could not create DOWNLOAD.TMP. errno=");
+    Serial.print(errno);
+    Serial.print(" ");
+    Serial.println(strerror(errno));
+
+    return false;
+  }
+
+  Serial.println();
+  Serial.print("Downloading: ");
+  Serial.println(photo.name);
+
+  Serial.print("Size: ");
+  Serial.print((unsigned long long)photo.size);
+  Serial.println(" bytes");
+
+  usbTransferActive = true;
+  abortUsbTransfer = false;
+
+  uint64_t offset = 0;
+  uint64_t sinceFlush = 0;
+  int lastPercent = -1;
+  bool success = true;
+
+  while (offset < photo.size)
+  {
+    if (abortUsbTransfer)
+    {
+      Serial.println("Download aborted.");
+
+      success = false;
+      break;
+    }
+
+    size_t requestLength =
+      (size_t)min(
+        (uint64_t)DOWNLOAD_CHUNK_SIZE,
+        photo.size - offset
+      );
+
+    size_t decodedLength = 0;
+
+    if (
+      !fetchDriveChunk(
+        photo,
+        offset,
+        requestLength,
+        decodedLength
+      )
+    )
+    {
+      Serial.println("Failed to receive chunk.");
+
+      success = false;
+      break;
+    }
+
+    if (decodedLength == 0)
+    {
+      Serial.println("Received empty chunk.");
+
+      success = false;
+      break;
+    }
+
+    size_t written =
+      fwrite(
+        downloadDecodeBuffer,
+        1,
+        decodedLength,
+        file
+      );
+
+    if (written != decodedLength)
+    {
+      Serial.print("USB write failed. errno=");
+      Serial.print(errno);
+      Serial.print(" ");
+      Serial.println(strerror(errno));
+
+      success = false;
+      break;
+    }
+
+    offset += decodedLength;
+    sinceFlush += decodedLength;
+
+    if (sinceFlush >= 1024ULL * 1024ULL)
+    {
+      fflush(file);
+      sinceFlush = 0;
+    }
+
+    int percent =
+      (int)((offset * 100ULL) / photo.size);
+
+    if (percent != lastPercent && (percent % 5 == 0 || percent == 100))
+    {
+      Serial.print("Download ");
+      Serial.print(percent);
+      Serial.println("%");
+
+      lastPercent = percent;
+    }
+  }
+
+  if (success)
+  {
+    if (fflush(file) != 0)
+    {
+      success = false;
+    }
+  }
+
+  if (fclose(file) != 0)
+  {
+    success = false;
+  }
+
+  usbTransferActive = false;
+
+  if (!success)
+  {
+    remove(tempPath);
+
+    return false;
+  }
+
+  struct stat tempStat;
+
+  if (
+    stat(tempPath, &tempStat) != 0 ||
+    (uint64_t)tempStat.st_size != photo.size
+  )
+  {
+    Serial.println("Downloaded byte count verification FAILED.");
+
+    remove(tempPath);
+
+    return false;
+  }
+
+  // Replace an old incomplete/mismatched destination if present.
+  remove(finalPath.c_str());
+
+  if (rename(tempPath, finalPath.c_str()) != 0)
+  {
+    Serial.print("Rename to final filename failed. errno=");
+    Serial.print(errno);
+    Serial.print(" ");
+    Serial.println(strerror(errno));
+
+    remove(tempPath);
+
+    return false;
+  }
+
+  Serial.print("Saved: ");
+  Serial.println(finalPath);
+
+  return true;
+}
+
+
+// ------------------------------------------------------------------
+// SYNC MISSING DRIVE PHOTOS
+// ------------------------------------------------------------------
+
+void syncDriveToUSB()
+{
+  if (!wifiSettingsConfigured())
+  {
+    Serial.println();
+    Serial.println("Drive sync not configured yet.");
+    Serial.println("Set WIFI_SSID, WIFI_PASSWORD, and APPS_SCRIPT_TOKEN.");
+
+    return;
+  }
+
+  DrivePhoto photos[MAX_DRIVE_PHOTOS];
+  int photoCount = 0;
+
+  if (!fetchDrivePhotoList(photos, photoCount))
+  {
+    return;
+  }
+
+  Serial.println();
+  Serial.println("========================");
+  Serial.println("DRIVE -> USB SYNC");
+  Serial.println("========================");
+
+  int downloaded = 0;
+  int skipped = 0;
+  int failed = 0;
+
+  for (int i = 0; i < photoCount; i++)
+  {
+    handlePowerButton();
+
+    if (abortUsbTransfer)
+    {
+      break;
+    }
+
+    DrivePhoto &photo = photos[i];
+
+    if (
+      photo.size == 0 ||
+      photo.size > MAX_PHOTO_SIZE ||
+      (
+        photo.mimeType != "image/jpeg" &&
+        photo.mimeType != "image/png"
+      )
+    )
+    {
+      skipped++;
+      continue;
+    }
+
+    String path = USB_MOUNT_POINT "/PHOTOS/";
+    path += sanitizeFilename(photo.name);
+
+    if (fileMatchesSize(path, photo.size))
+    {
+      skipped++;
+      continue;
+    }
+
+    if (downloadPhotoToUSB(photo))
+    {
+      downloaded++;
+    }
+    else
+    {
+      failed++;
+    }
+  }
+
+  Serial.println();
+  Serial.println("========================");
+  Serial.println("SYNC COMPLETE");
+  Serial.println("========================");
+
+  Serial.print("Downloaded: ");
+  Serial.println(downloaded);
+
+  Serial.print("Skipped: ");
+  Serial.println(skipped);
+
+  Serial.print("Failed: ");
+  Serial.println(failed);
+}
+
 
 bool mountUSBDrive(uint8_t address)
 {
@@ -1182,12 +2248,25 @@ bool mountUSBDrive(uint8_t address)
   Serial.println("USB DRIVE MOUNTED");
   Serial.println("========================");
 
-  listUSBFiles();
-  bool writeOK = writeUSBTestFile();
-  bool readOK = writeOK ? readUSBTestFile() : false;
-  Serial.println(writeOK && readOK ? "\nUSB STORAGE TEST PASSED" : "\nUSB STORAGE TEST FAILED");
-  listUSBFiles();
-  return true;
+listUSBFiles();
+
+bool writeOK = writeUSBTestFile();
+bool readOK = writeOK ? readUSBTestFile() : false;
+
+Serial.println(
+  writeOK && readOK
+    ? "\nUSB STORAGE TEST PASSED"
+    : "\nUSB STORAGE TEST FAILED"
+);
+
+listUSBFiles();
+
+// NOW START GOOGLE DRIVE SYNC
+syncDriveToUSB();
+
+listUSBFiles();
+
+return true;
 }
 
 void usbHostTask(void *parameter)
@@ -1578,6 +2657,7 @@ void loop()
   // =================================================================
 
   if (
+    !usbTransferActive &&
     millis() - lastPersonTime
     >= INACTIVITY_TIME
   )
@@ -1601,3 +2681,6 @@ extern "C" void app_main()
   setup();
   while (true) { loop(); }
 }
+
+
+
