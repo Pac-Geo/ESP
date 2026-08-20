@@ -99,7 +99,7 @@
   DRIVE SYNC:
       - gets the Drive photo list from Apps Script
       - downloads only missing JPEG/PNG files
-      - streams in 64 KiB chunks
+      - streams in 16 KiB chunks
       - supports files up to 100 MiB
       - writes to DOWNLOAD.TMP first
       - verifies byte count
@@ -214,6 +214,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
+#include <new>
 
 #include "usb/msc_host.h"
 #include "usb/msc_host_vfs.h"
@@ -258,15 +259,15 @@ const char *WIFI_PASSWORD = "Getstarted";
 // Current Apps Script deployment URL.
 const char *APPS_SCRIPT_URL =
   "https://script.google.com/macros/s/"
-  "AKfycbwtlhKjaVmti-3wV93wjcWWrSzJoCef7aNbnv91G8qQ1PXZcp5p0gHhdbdXD44aXakt3Q/"
+  "AKfycbzke5eN-5VNLriVYGjG8mH4-dEWb1km7iGoxhgm262S62JwzOVulGjC9ajhb3DQ8ZdRJA/"
   "exec";
 
 const char *APPS_SCRIPT_TOKEN =
   "facildeconectar";
 
 // Raw bytes per Drive request.
-// 64 KiB keeps ESP RAM use bounded while still supporting very large files.
-const size_t DOWNLOAD_CHUNK_SIZE = 64 * 1024;
+// 16 KiB keeps ESP RAM use bounded while still supporting very large files.
+const size_t DOWNLOAD_CHUNK_SIZE = 16 * 1024;
 
 // Policy limit only.  The whole file is NEVER stored in ESP RAM.
 const uint64_t MAX_PHOTO_SIZE =
@@ -1446,6 +1447,10 @@ bool ensureWiFi()
   Serial.print("Connecting to WiFi: ");
   Serial.println(WIFI_SSID);
 
+  Serial.print("Current task stack free before WiFi: ");
+  Serial.print(uxTaskGetStackHighWaterMark(NULL));
+  Serial.println(" words");
+
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
@@ -1486,45 +1491,214 @@ bool httpsGetString(
   String &responseBody
 )
 {
-  WiFiClientSecure client;
-  client.setInsecure();
+  // Handle redirects ourselves so we can see exactly where an
+  // Apps Script request is spending its time.
+  const int MAX_HTTP_REDIRECTS = 5;
 
-  HTTPClient http;
+  String currentUrl = url;
+  responseBody = "";
 
-  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-  http.setTimeout(HTTP_TIMEOUT_MS);
-
-  if (!http.begin(client, url))
+  for (int redirectCount = 0;
+       redirectCount <= MAX_HTTP_REDIRECTS;
+       redirectCount++)
   {
-    Serial.println("HTTP begin failed.");
+    Serial.println();
+    Serial.println("------------------------");
+    Serial.print("HTTP request #");
+    Serial.println(redirectCount + 1);
 
-    return false;
-  }
+    Serial.print("Free heap before request: ");
+    Serial.print(ESP.getFreeHeap());
+    Serial.println(" bytes");
 
-  int code = http.GET();
+    Serial.print("URL length: ");
+    Serial.println(currentUrl.length());
 
-  if (code != HTTP_CODE_OK)
-  {
-    Serial.print("HTTP GET failed. Code: ");
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(HTTP_TIMEOUT_MS / 1000);
+
+    HTTPClient http;
+
+    // IMPORTANT:
+    // Do not let HTTPClient automatically follow Google redirects.
+    // We want to observe and follow each redirect ourselves.
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.setReuse(false);
+
+    Serial.println("HTTP begin...");
+
+    unsigned long beginStarted = millis();
+
+    if (!http.begin(client, currentUrl))
+    {
+      Serial.print("HTTP begin FAILED after ");
+      Serial.print(millis() - beginStarted);
+      Serial.println(" ms");
+
+      return false;
+    }
+
+    Serial.print("HTTP begin OK in ");
+    Serial.print(millis() - beginStarted);
+    Serial.println(" ms");
+
+    Serial.println("HTTP GET starting...");
+
+    unsigned long getStarted = millis();
+
+    int code = http.GET();
+
+    unsigned long getElapsed =
+      millis() - getStarted;
+
+    Serial.print("HTTP GET returned: ");
     Serial.println(code);
 
-    responseBody = http.getString();
+    Serial.print("HTTP GET elapsed: ");
+    Serial.print(getElapsed);
+    Serial.println(" ms");
 
-    if (responseBody.length())
+    Serial.print("Reported content length: ");
+    Serial.println(http.getSize());
+
+    Serial.print("Free heap after GET: ");
+    Serial.print(ESP.getFreeHeap());
+    Serial.println(" bytes");
+
+    if (code < 0)
     {
-      Serial.println(responseBody);
+      Serial.print("HTTP transport error: ");
+      Serial.println(
+        HTTPClient::errorToString(code).c_str()
+      );
+
+      http.end();
+
+      return false;
     }
+
+    // Google Apps Script commonly redirects from script.google.com
+    // to a googleusercontent.com endpoint.
+    if (
+      code == HTTP_CODE_MOVED_PERMANENTLY ||
+      code == HTTP_CODE_FOUND ||
+      code == HTTP_CODE_SEE_OTHER ||
+      code == HTTP_CODE_TEMPORARY_REDIRECT ||
+      code == HTTP_CODE_PERMANENT_REDIRECT
+    )
+    {
+      String location =
+        http.getLocation();
+
+      Serial.print("Redirect received. Location length: ");
+      Serial.println(location.length());
+
+      if (location.length() == 0)
+      {
+        Serial.println("ERROR: Redirect had no Location header.");
+
+        http.end();
+
+        return false;
+      }
+
+      // Print only the destination host/path prefix, not the complete
+      // redirect URL, because it can contain temporary authorization data.
+      int schemePos =
+        location.indexOf("://");
+
+      int hostStart =
+        schemePos >= 0
+          ? schemePos + 3
+          : 0;
+
+      int pathStart =
+        location.indexOf('/', hostStart);
+
+      String destination =
+        pathStart >= 0
+          ? location.substring(0, pathStart)
+          : location;
+
+      Serial.print("Redirect destination: ");
+      Serial.println(destination);
+
+      http.end();
+
+      currentUrl = location;
+
+      Serial.println("Following redirect manually...");
+
+      continue;
+    }
+
+    if (code != HTTP_CODE_OK)
+    {
+      Serial.print("HTTP GET failed. Code: ");
+      Serial.println(code);
+
+      Serial.println("Reading error response body...");
+
+      unsigned long bodyStarted =
+        millis();
+
+      responseBody =
+        http.getString();
+
+      Serial.print("Error body read in ");
+      Serial.print(millis() - bodyStarted);
+      Serial.println(" ms");
+
+      Serial.print("Error body length: ");
+      Serial.println(responseBody.length());
+
+      if (responseBody.length())
+      {
+        Serial.println(responseBody);
+      }
+
+      http.end();
+
+      return false;
+    }
+
+    Serial.println("HTTP 200 OK");
+    Serial.println("Reading response body...");
+
+    unsigned long bodyStarted =
+      millis();
+
+    responseBody =
+      http.getString();
+
+    unsigned long bodyElapsed =
+      millis() - bodyStarted;
+
+    Serial.print("Response body read in ");
+    Serial.print(bodyElapsed);
+    Serial.println(" ms");
+
+    Serial.print("Response body length: ");
+    Serial.println(responseBody.length());
+
+    Serial.print("Free heap after body: ");
+    Serial.print(ESP.getFreeHeap());
+    Serial.println(" bytes");
 
     http.end();
 
-    return false;
+    Serial.println("------------------------");
+
+    return true;
   }
 
-  responseBody = http.getString();
+  Serial.println(
+    "ERROR: Too many HTTP redirects."
+  );
 
-  http.end();
-
-  return true;
+  return false;
 }
 
 
@@ -1656,6 +1830,7 @@ bool fetchDrivePhotoList(
 
   Serial.println();
   Serial.println("Requesting Google Drive photo list...");
+  Serial.println("HTTP redirect diagnostics enabled.");
 
   String body;
 
@@ -2041,14 +2216,18 @@ bool downloadPhotoToUSB(const DrivePhoto &photo)
     int percent =
       (int)((offset * 100ULL) / photo.size);
 
-    if (percent != lastPercent && (percent % 5 == 0 || percent == 100))
-    {
-      Serial.print("Download ");
-      Serial.print(percent);
-      Serial.println("%");
+  if (percent != lastPercent && (percent % 5 == 0 || percent == 100))
+{
+  Serial.println();
+  Serial.println("================================");
+  Serial.print("       DOWNLOAD: ");
+  Serial.print(percent);
+  Serial.println("%");
+  Serial.println("================================");
+  Serial.println();
 
-      lastPercent = percent;
-    }
+  lastPercent = percent;
+}
   }
 
   if (success)
@@ -2124,11 +2303,20 @@ void syncDriveToUSB()
     return;
   }
 
-  DrivePhoto photos[MAX_DRIVE_PHOTOS];
+  DrivePhoto *photos =
+    new (std::nothrow) DrivePhoto[MAX_DRIVE_PHOTOS];
+
+  if (!photos)
+  {
+    Serial.println("ERROR: Could not allocate Drive photo list.");
+    return;
+  }
+
   int photoCount = 0;
 
   if (!fetchDrivePhotoList(photos, photoCount))
   {
+    delete[] photos;
     return;
   }
 
@@ -2197,6 +2385,8 @@ void syncDriveToUSB()
 
   Serial.print("Failed: ");
   Serial.println(failed);
+
+  delete[] photos;
 }
 
 
@@ -2262,7 +2452,14 @@ Serial.println(
 listUSBFiles();
 
 // NOW START GOOGLE DRIVE SYNC
+Serial.println();
+Serial.println(">>> STARTING GOOGLE DRIVE SYNC <<<");
+Serial.flush();
+
 syncDriveToUSB();
+
+Serial.println(">>> GOOGLE DRIVE SYNC RETURNED <<<");
+Serial.flush();
 
 listUSBFiles();
 
@@ -2332,7 +2529,7 @@ bool setupUSBHost()
     Serial.println("USB Host task creation FAILED");
     return false;
   }
-  if (xTaskCreate(usbApplicationTask, "USB App", 6144, NULL, 1, NULL) != pdPASS) {
+  if (xTaskCreate(usbApplicationTask, "USB App", 16384, NULL, 1, NULL) != pdPASS) {
     Serial.println("USB App task creation FAILED");
     return false;
   }
@@ -2681,6 +2878,3 @@ extern "C" void app_main()
   setup();
   while (true) { loop(); }
 }
-
-
-
