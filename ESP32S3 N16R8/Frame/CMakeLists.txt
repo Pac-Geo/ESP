@@ -1,12 +1,6 @@
-idf_component_register(
-    SRCS "Frame_IDF.cpp"
-    INCLUDE_DIRS "."
-    REQUIRES
-        arduino-esp32
-        usb_host_msc
-        mbedtls
-        Adafruit_AMG88xx_Library
-        Adafruit_GFX_Library
-        Adafruit_SSD1306
-        Adafruit_BusIO
-)
+# The following five lines of boilerplate have to be in your project's
+# CMakeLists in this exact order for cmake to work correctly
+cmake_minimum_required(VERSION 3.16)
+
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(Frame_IDF)
