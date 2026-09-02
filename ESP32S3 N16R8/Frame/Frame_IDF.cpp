@@ -1115,193 +1115,396 @@ bool detectPerson()
 
 
 // ==================================================================
-// VGA TEST - 640x480 @ ~60 Hz, RGB332
+// VGA RGB565 - STOP / RENDER / START ARCHITECTURE
 // ==================================================================
-// RGB: R2/R1/R0=GPIO4/5/6, G2/G1/G0=GPIO7/8/9,
-//      B1/B0=GPIO10/11, HSYNC=GPIO12, VSYNC=GPIO13.
-// GPIO14 is used as the ESP LCD peripheral PCLK output ONLY.
-// DO NOT connect GPIO14 to the VGA connector. DE is not used.
+// PHYSICAL RGB565 PINOUT:
+//   R0/R1/R2/R3/R4       = GPIO4, GPIO5, GPIO6, GPIO7, GPIO8
+//   G0/G1/G2/G3/G4/G5    = GPIO9, GPIO10, GPIO11, GPIO38, GPIO39, GPIO40
+//   B0/B1/B2/B3/B4       = GPIO41, GPIO42, GPIO47, GPIO1, GPIO2
+//   HSYNC = GPIO12, VSYNC = GPIO13
+//   GPIO14 is the LCD peripheral PCLK ONLY; do not connect it to VGA.
+//
+// IMPORTANT:
+//   RGB565 scanout is stable when ESP-IDF copies a STATIC PSRAM framebuffer
+//   into small internal-SRAM bounce buffers. It became unstable when the CPU
+//   modified PSRAM while scanout was active.
+//
+//   Therefore this version NEVER writes the VGA framebuffer while the panel
+//   is scanning. To change the picture it does:
+//
+//     stop/delete RGB panel -> decode JPEG -> create panel (not started yet)
+//     -> fill its PSRAM framebuffer -> start scanout
+//
+//   Once scanout starts, that framebuffer stays read-only.
 
 const int VGA_WIDTH = 640;
 const int VGA_HEIGHT = 480;
+const int VGA_BOUNCE_LINES = 4;
+
 static esp_lcd_panel_handle_t vgaPanel = NULL;
-static uint8_t *vgaFB = NULL;
+static uint16_t *vgaFB = NULL;
 static bool vgaReady = false;
 
-static inline uint8_t toRGB332(uint8_t r,uint8_t g,uint8_t b) {
-  return (r & 0xE0) | ((g & 0xE0) >> 3) | (b >> 6);
+static inline uint16_t toRGB565(uint8_t r, uint8_t g, uint8_t b)
+{
+  return (uint16_t)(((uint16_t)(r & 0xF8) << 8) |
+                    ((uint16_t)(g & 0xFC) << 3) |
+                    ((uint16_t)b >> 3));
 }
 
-void vgaColorBars() {
-  if (!vgaFB) return;
-  const uint8_t c[8]={0xE0,0x1C,0x03,0xFC,0xE3,0x1F,0xFF,0x00};
-  for(int y=0;y<VGA_HEIGHT;y++)
-    for(int x=0;x<VGA_WIDTH;x++)
-      vgaFB[y*VGA_WIDTH+x]=c[(x*8)/VGA_WIDTH];
-  Serial.println("VGA COLOR BARS ACTIVE");
+static esp_lcd_rgb_panel_config_t makeVgaConfig()
+{
+  esp_lcd_rgb_panel_config_t c = {};
+  c.clk_src = LCD_CLK_SRC_DEFAULT;
+  c.data_width = 16;
+  c.bits_per_pixel = 16;
+  c.num_fbs = 1;
+  c.bounce_buffer_size_px = VGA_BOUNCE_LINES * VGA_WIDTH;
+  c.dma_burst_size = 64;
+  c.hsync_gpio_num = 12;
+  c.vsync_gpio_num = 13;
+  c.de_gpio_num = -1;
+  c.pclk_gpio_num = 14;
+  c.disp_gpio_num = -1;
+
+  // ESP LCD RGB565 bus order: D0..D4=B0..B4,
+  // D5..D10=G0..G5, D11..D15=R0..R4.
+  c.data_gpio_nums[0]  = 41; // B0 LSB
+  c.data_gpio_nums[1]  = 42; // B1
+  c.data_gpio_nums[2]  = 47; // B2
+  c.data_gpio_nums[3]  = 1;  // B3
+  c.data_gpio_nums[4]  = 2;  // B4 MSB
+
+  c.data_gpio_nums[5]  = 9;  // G0 LSB
+  c.data_gpio_nums[6]  = 10; // G1
+  c.data_gpio_nums[7]  = 11; // G2
+  c.data_gpio_nums[8]  = 38; // G3
+  c.data_gpio_nums[9]  = 39; // G4
+  c.data_gpio_nums[10] = 40; // G5 MSB
+
+  c.data_gpio_nums[11] = 4;  // R0 LSB
+  c.data_gpio_nums[12] = 5;  // R1
+  c.data_gpio_nums[13] = 6;  // R2
+  c.data_gpio_nums[14] = 7;  // R3
+  c.data_gpio_nums[15] = 8;  // R4 MSB
+
+  c.timings.pclk_hz = 25175000;
+  c.timings.h_res = VGA_WIDTH;
+  c.timings.v_res = VGA_HEIGHT;
+  c.timings.hsync_pulse_width = 96;
+  c.timings.hsync_back_porch = 48;
+  c.timings.hsync_front_porch = 16;
+  c.timings.vsync_pulse_width = 2;
+  c.timings.vsync_back_porch = 33;
+  c.timings.vsync_front_porch = 10;
+  c.timings.flags.hsync_idle_low = 0;
+  c.timings.flags.vsync_idle_low = 0;
+
+  c.flags.fb_in_psram = 1;
+  c.flags.no_fb = 0;
+  c.flags.bb_invalidate_cache = 1;
+  return c;
 }
 
-bool setupVGA() {
-  Serial.println("\\n========================");
-  Serial.println("VGA START 640x480 RGB332");
-  Serial.println("========================");
+static void stopVGA()
+{
+  vgaReady = false;
+  vgaFB = NULL;
 
-  esp_lcd_rgb_panel_config_t c={};
-  c.clk_src=LCD_CLK_SRC_DEFAULT;
-  c.data_width=8;
-  c.bits_per_pixel=8;
-  c.num_fbs=1;
-  c.dma_burst_size=64;
-  c.hsync_gpio_num=12;
-  c.vsync_gpio_num=13;
-  c.de_gpio_num=-1;
-  c.pclk_gpio_num=14;       // leave physically unconnected from VGA
-  c.disp_gpio_num=-1;
-
-  // D0..D7 = B0,B1,G0,G1,G2,R0,R1,R2
-  c.data_gpio_nums[0]=11;
-  c.data_gpio_nums[1]=10;
-  c.data_gpio_nums[2]=9;
-  c.data_gpio_nums[3]=8;
-  c.data_gpio_nums[4]=7;
-  c.data_gpio_nums[5]=6;
-  c.data_gpio_nums[6]=5;
-  c.data_gpio_nums[7]=4;
-
-  // 640x480@60: 25.175 MHz, 800 total pixels, 525 total lines.
-  c.timings.pclk_hz=25175000;
-  c.timings.h_res=640;
-  c.timings.v_res=480;
-  c.timings.hsync_pulse_width=96;
-  c.timings.hsync_back_porch=48;
-  c.timings.hsync_front_porch=16;
-  c.timings.vsync_pulse_width=2;
-  c.timings.vsync_back_porch=33;
-  c.timings.vsync_front_porch=10;
-  c.timings.flags.hsync_idle_low=0;
-  c.timings.flags.vsync_idle_low=0;
-  c.flags.fb_in_psram=1;
-
-  esp_err_t e=esp_lcd_new_rgb_panel(&c,&vgaPanel);
-  if(e!=ESP_OK){Serial.printf("VGA create failed: %s\\n",esp_err_to_name(e));return false;}
-  if((e=esp_lcd_panel_reset(vgaPanel))!=ESP_OK ||
-     (e=esp_lcd_panel_init(vgaPanel))!=ESP_OK){
-    Serial.printf("VGA init failed: %s\\n",esp_err_to_name(e));return false;
+  if (vgaPanel) {
+    Serial.println("Stopping VGA scanout before framebuffer update...");
+    esp_err_t e = esp_lcd_panel_del(vgaPanel);
+    if (e != ESP_OK) {
+      Serial.printf("VGA panel delete warning: %s\n", esp_err_to_name(e));
+    }
+    vgaPanel = NULL;
+    delay(20);
   }
-  void *p=NULL;
-  e=esp_lcd_rgb_panel_get_frame_buffer(vgaPanel,1,&p);
-  if(e!=ESP_OK || !p){Serial.println("VGA framebuffer unavailable");return false;}
-  vgaFB=(uint8_t*)p;
-  vgaReady=true;
-  vgaColorBars();
-  Serial.println("HSYNC GPIO12 / VSYNC GPIO13");
-  Serial.println("GPIO14 is PCLK only; NOT connected to VGA.");
-  return true;
 }
 
-bool loadFilePSRAM(const char *path,uint8_t **buf,size_t *len){
-  *buf=NULL;*len=0;
-  FILE *f=fopen(path,"rb"); if(!f)return false;
-  fseek(f,0,SEEK_END); long n=ftell(f); rewind(f);
-  if(n<=0){fclose(f);return false;}
-  uint8_t *p=(uint8_t*)heap_caps_aligned_alloc(16,n,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
-  if(!p){fclose(f);return false;}
-  size_t got=fread(p,1,n,f); fclose(f);
-  if(got!=(size_t)n){free(p);return false;}
-  *buf=p;*len=got;return true;
-}
-
-bool showJpegVGA(const char *path){
-  if(!vgaReady)return false;
-  Serial.printf("\\nVGA JPEG: %s\\n",path);
-
-  uint8_t *jpg=NULL; size_t jpgLen=0;
-  if(!loadFilePSRAM(path,&jpg,&jpgLen)){Serial.println("JPEG read failed");return false;}
-
-  jpeg_dec_config_t probeCfg=DEFAULT_JPEG_DEC_CONFIG();
-  jpeg_dec_handle_t probe=NULL;
-  if(jpeg_dec_open(&probeCfg,&probe)!=JPEG_ERR_OK){free(jpg);return false;}
-  jpeg_dec_io_t pio={}; pio.inbuf=jpg; pio.inbuf_len=jpgLen;
-  jpeg_dec_header_info_t src={};
-  jpeg_error_t je=jpeg_dec_parse_header(probe,&pio,&src);
-  jpeg_dec_close(probe);
-  if(je!=JPEG_ERR_OK){free(jpg);Serial.println("JPEG header failed");return false;}
-
-  Serial.printf("Source %ux%u\\n",src.width,src.height);
-
-  float s=(float)VGA_WIDTH/src.width;
-  float sy=(float)VGA_HEIGHT/src.height;
-  if(sy<s)s=sy;
-  if(s>1.0f)s=1.0f;
-  int w=((int)(src.width*s))&~7;
-  int h=((int)(src.height*s))&~7;
-  if (w < 8) {
-    w = 8;
-  }
-
-  if (h < 8) {
-    h = 8;
-  }
-
-  // esp_new_jpeg can downscale by at most 8x.
-  if(w < src.width/8 || h < src.height/8 || w>640 || h>480){
-    Serial.println("JPEG too large for first test; use a smaller baseline JPEG.");
-    free(jpg);return false;
-  }
-
-  jpeg_dec_config_t cfg=DEFAULT_JPEG_DEC_CONFIG();
-  cfg.output_type=JPEG_PIXEL_FORMAT_RGB888;
-  cfg.scale.width=w; cfg.scale.height=h;
-
-  jpeg_dec_handle_t dec=NULL;
-  if(jpeg_dec_open(&cfg,&dec)!=JPEG_ERR_OK){free(jpg);return false;}
-  jpeg_dec_io_t io={};io.inbuf=jpg;io.inbuf_len=jpgLen;
-  jpeg_dec_header_info_t info={};
-  je=jpeg_dec_parse_header(dec,&io,&info);
-  int outLen=0;
-  if(je==JPEG_ERR_OK)je=jpeg_dec_get_outbuf_len(dec,&outLen);
-  uint8_t *rgb = (je == JPEG_ERR_OK)
-    ? static_cast<uint8_t *>(jpeg_calloc_align(outLen, 16))
-    : nullptr;
-  if(!rgb)je=JPEG_ERR_NO_MEM;
-  if(je==JPEG_ERR_OK){io.outbuf=rgb;je=jpeg_dec_process(dec,&io);}
-  jpeg_dec_close(dec);free(jpg);
-
-  if(je!=JPEG_ERR_OK){
-    if(rgb)free(rgb);
-    Serial.println("JPEG decode failed (use baseline JPEG, not progressive).");
+static bool createVgaPanelUnstarted()
+{
+  esp_lcd_rgb_panel_config_t c = makeVgaConfig();
+  esp_err_t e = esp_lcd_new_rgb_panel(&c, &vgaPanel);
+  if (e != ESP_OK) {
+    Serial.printf("VGA create failed: %s\n", esp_err_to_name(e));
+    vgaPanel = NULL;
     return false;
   }
 
-  memset(vgaFB,0,VGA_WIDTH*VGA_HEIGHT);
-  int x0=(VGA_WIDTH-info.width)/2,y0=(VGA_HEIGHT-info.height)/2;
-  for(int y=0;y<info.height;y++){
-    uint8_t *d=vgaFB+(y0+y)*VGA_WIDTH+x0;
-    uint8_t *srow=rgb+(size_t)y*info.width*3;
-    for(int x=0;x<info.width;x++)
-      d[x]=toRGB332(srow[x*3],srow[x*3+1],srow[x*3+2]);
+  void *fb = NULL;
+  e = esp_lcd_rgb_panel_get_frame_buffer(vgaPanel, 1, &fb);
+  if (e != ESP_OK || !fb) {
+    Serial.printf("VGA framebuffer unavailable before init: %s\n", esp_err_to_name(e));
+    esp_lcd_panel_del(vgaPanel);
+    vgaPanel = NULL;
+    return false;
   }
-  free(rgb);
-  Serial.printf("VGA JPEG DISPLAYED %ux%u\\n",info.width,info.height);
+
+  vgaFB = static_cast<uint16_t *>(fb);
   return true;
 }
 
-bool showFirstUsbJpegVGA(){
-  DIR *d=opendir(USB_MOUNT_POINT "/PHOTOS");
-  if(!d){Serial.println("No /PHOTOS yet; keeping VGA bars.");return false;}
-  struct dirent *e;bool ok=false;
-  while((e=readdir(d))){
-    String n=e->d_name,l=n;l.toLowerCase();
-    if(l.endsWith(".jpg")||l.endsWith(".jpeg")){
-      String p=String(USB_MOUNT_POINT "/PHOTOS/")+n;
-      ok=showJpegVGA(p.c_str());
-      if(ok)break;
+static bool startVGA()
+{
+  if (!vgaPanel || !vgaFB) return false;
+
+  esp_err_t e = esp_lcd_panel_reset(vgaPanel);
+  if (e == ESP_OK) e = esp_lcd_panel_init(vgaPanel);
+  if (e != ESP_OK) {
+    Serial.printf("VGA init failed: %s\n", esp_err_to_name(e));
+    esp_lcd_panel_del(vgaPanel);
+    vgaPanel = NULL;
+    vgaFB = NULL;
+    return false;
+  }
+
+  vgaReady = true;
+  return true;
+}
+
+static void vgaDrawRGB565ColorBars()
+{
+  if (!vgaFB) return;
+
+  const uint16_t bars[8] = {
+    0xF800, 0x07E0, 0x001F, 0xFFE0,
+    0x07FF, 0xF81F, 0xFFFF, 0x0000
+  };
+
+  for (int y = 0; y < VGA_HEIGHT; ++y) {
+    uint16_t *row = vgaFB + (size_t)y * VGA_WIDTH;
+    for (int x = 0; x < VGA_WIDTH; ++x) {
+      row[x] = bars[(x * 8) / VGA_WIDTH];
+    }
+    if ((y & 15) == 0) taskYIELD();
+  }
+}
+
+bool setupVGA()
+{
+  Serial.println();
+  Serial.println("========================");
+  Serial.println("VGA RGB565 STOP-RENDER-START");
+  Serial.println("========================");
+  Serial.println("640x480 @ 25.175 MHz");
+  Serial.println("PSRAM framebuffer + 4-line SRAM bounce buffers");
+  Serial.println("Framebuffer is read-only whenever scanout is active");
+
+  stopVGA();
+  if (!createVgaPanelUnstarted()) return false;
+
+  Serial.println("Prefilling startup RGB565 color bars...");
+  vgaDrawRGB565ColorBars();
+
+  if (!startVGA()) return false;
+
+  Serial.println("VGA STARTUP BARS ACTIVE");
+  Serial.println("Waiting for USB JPEG...");
+  return true;
+}
+
+bool loadFilePSRAM(const char *path, uint8_t **buf, size_t *len)
+{
+  *buf = NULL;
+  *len = 0;
+  FILE *f = fopen(path, "rb");
+  if (!f) return false;
+
+  fseek(f, 0, SEEK_END);
+  long n = ftell(f);
+  rewind(f);
+  if (n <= 0) {
+    fclose(f);
+    return false;
+  }
+
+  uint8_t *p = static_cast<uint8_t *>(
+    heap_caps_aligned_alloc(16, (size_t)n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+  );
+  if (!p) {
+    fclose(f);
+    return false;
+  }
+
+  size_t got = fread(p, 1, (size_t)n, f);
+  fclose(f);
+  if (got != (size_t)n) {
+    free(p);
+    return false;
+  }
+
+  *buf = p;
+  *len = got;
+  return true;
+}
+
+bool showJpegVGA(const char *path)
+{
+  Serial.printf("\nVGA RGB565 JPEG: %s\n", path);
+  Serial.println("Stopping VGA before JPEG/PSRAM work...");
+
+  // Absolutely no LCD scanout while JPEG data or the RGB565 framebuffer
+  // is being created in PSRAM.
+  stopVGA();
+
+  uint8_t *jpg = NULL;
+  size_t jpgLen = 0;
+  if (!loadFilePSRAM(path, &jpg, &jpgLen)) {
+    Serial.println("JPEG read failed; restoring color bars.");
+    setupVGA();
+    return false;
+  }
+
+  jpeg_dec_config_t probeCfg = DEFAULT_JPEG_DEC_CONFIG();
+  jpeg_dec_handle_t probe = NULL;
+  if (jpeg_dec_open(&probeCfg, &probe) != JPEG_ERR_OK) {
+    free(jpg);
+    setupVGA();
+    return false;
+  }
+
+  jpeg_dec_io_t pio = {};
+  pio.inbuf = jpg;
+  pio.inbuf_len = jpgLen;
+  jpeg_dec_header_info_t src = {};
+  jpeg_error_t je = jpeg_dec_parse_header(probe, &pio, &src);
+  jpeg_dec_close(probe);
+  if (je != JPEG_ERR_OK) {
+    free(jpg);
+    Serial.println("JPEG header failed; restoring color bars.");
+    setupVGA();
+    return false;
+  }
+
+  Serial.printf("Source %ux%u\n", src.width, src.height);
+
+  float s = (float)VGA_WIDTH / src.width;
+  float sy = (float)VGA_HEIGHT / src.height;
+  if (sy < s) s = sy;
+  if (s > 1.0f) s = 1.0f;
+  int w = ((int)(src.width * s)) & ~7;
+  int h = ((int)(src.height * s)) & ~7;
+  if (w < 8) w = 8;
+  if (h < 8) h = 8;
+
+  if (w < src.width / 8 || h < src.height / 8 ||
+      w > VGA_WIDTH || h > VGA_HEIGHT) {
+    Serial.println("JPEG too large for decoder scaling at this VGA mode.");
+    free(jpg);
+    setupVGA();
+    return false;
+  }
+
+  jpeg_dec_config_t cfg = DEFAULT_JPEG_DEC_CONFIG();
+  cfg.output_type = JPEG_PIXEL_FORMAT_RGB888;
+  cfg.scale.width = w;
+  cfg.scale.height = h;
+
+  jpeg_dec_handle_t dec = NULL;
+  if (jpeg_dec_open(&cfg, &dec) != JPEG_ERR_OK) {
+    free(jpg);
+    setupVGA();
+    return false;
+  }
+
+  jpeg_dec_io_t io = {};
+  io.inbuf = jpg;
+  io.inbuf_len = jpgLen;
+  jpeg_dec_header_info_t info = {};
+  je = jpeg_dec_parse_header(dec, &io, &info);
+
+  int outLen = 0;
+  if (je == JPEG_ERR_OK) je = jpeg_dec_get_outbuf_len(dec, &outLen);
+
+  uint8_t *rgb = NULL;
+  if (je == JPEG_ERR_OK) {
+    rgb = static_cast<uint8_t *>(
+      heap_caps_aligned_alloc(16, (size_t)outLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+    );
+    if (!rgb) je = JPEG_ERR_NO_MEM;
+  }
+
+  if (je == JPEG_ERR_OK) {
+    io.outbuf = rgb;
+    je = jpeg_dec_process(dec, &io);
+  }
+
+  jpeg_dec_close(dec);
+  free(jpg);
+
+  if (je != JPEG_ERR_OK) {
+    if (rgb) free(rgb);
+    Serial.println("JPEG decode failed; restoring color bars.");
+    setupVGA();
+    return false;
+  }
+
+  Serial.printf("Decoded %ux%u; creating stopped VGA framebuffer...\n",
+                info.width, info.height);
+
+  if (!createVgaPanelUnstarted()) {
+    free(rgb);
+    return false;
+  }
+
+  // The panel exists but scanout has NOT started yet, so these PSRAM writes
+  // cannot contend with the LCD bounce-buffer ISR.
+  memset(vgaFB, 0, VGA_WIDTH * VGA_HEIGHT * sizeof(uint16_t));
+
+  int x0 = (VGA_WIDTH - info.width) / 2;
+  int y0 = (VGA_HEIGHT - info.height) / 2;
+
+  for (int y = 0; y < info.height; ++y) {
+    uint16_t *d = vgaFB + (size_t)(y0 + y) * VGA_WIDTH + x0;
+    const uint8_t *srow = rgb + (size_t)y * info.width * 3;
+
+    for (int x = 0; x < info.width; ++x) {
+      d[x] = toRGB565(srow[x * 3], srow[x * 3 + 1], srow[x * 3 + 2]);
+    }
+
+    if ((y & 15) == 0) taskYIELD();
+  }
+
+  free(rgb);
+  Serial.println("RGB565 PSRAM framebuffer complete; starting VGA scanout...");
+
+  if (!startVGA()) {
+    Serial.println("Could not restart VGA after JPEG render.");
+    return false;
+  }
+
+  Serial.printf("VGA RGB565 JPEG DISPLAYED %ux%u\n", info.width, info.height);
+  Serial.println("Framebuffer is now LOCKED read-only during scanout.");
+  return true;
+}
+
+bool showFirstUsbJpegVGA()
+{
+  DIR *d = opendir(USB_MOUNT_POINT "/PHOTOS");
+  if (!d) {
+    Serial.println("No /PHOTOS yet; keeping VGA RGB565 bars.");
+    return false;
+  }
+
+  struct dirent *e;
+  bool ok = false;
+  while ((e = readdir(d))) {
+    String n = e->d_name;
+    String l = n;
+    l.toLowerCase();
+    if (l.endsWith(".jpg") || l.endsWith(".jpeg")) {
+      String p = String(USB_MOUNT_POINT "/PHOTOS/") + n;
+      ok = showJpegVGA(p.c_str());
+      if (ok) break;
     }
   }
+
   closedir(d);
-  if(!ok)Serial.println("No decodable USB JPEG; keeping VGA bars.");
+  if (!ok) Serial.println("No decodable USB JPEG; VGA bars restored.");
   return ok;
 }
+
 
 // ==================================================================
 // USB MASS STORAGE FUNCTIONS
@@ -2706,9 +2909,10 @@ Serial.println(
 
 listUSBFiles();
 
-// VGA TEST: show the first JPEG already stored in /usb/PHOTOS.
-// If none can be decoded, the color bars remain on screen.
-showFirstUsbJpegVGA();
+// Display the first JPEG already present on USB. showJpegVGA() stops VGA
+// before touching PSRAM and restarts scanout only after the complete frame
+// is ready.
+bool usbPhotoDisplayed = showFirstUsbJpegVGA();
 
 // NOW START GOOGLE DRIVE SYNC
 Serial.println();
@@ -2721,6 +2925,12 @@ Serial.println(">>> GOOGLE DRIVE SYNC RETURNED <<<");
 Serial.flush();
 
 listUSBFiles();
+
+// If there was no usable JPEG before synchronization, try again now in case
+// Drive downloaded one. Do not redraw an already-active frame unnecessarily.
+if (!usbPhotoDisplayed) {
+  showFirstUsbJpegVGA();
+}
 
 return true;
 }
