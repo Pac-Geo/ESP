@@ -9,7 +9,6 @@
 
 #define RELAY_PIN D1  // Existing GPIO5 wiring; HIGH activates the relay.
 
-bool armed = true;
 //Spark computer status monitoring
 const IPAddress SPARK_IP(10, 0, 0, 103);
 
@@ -112,12 +111,30 @@ void checkSparkStatus() {
         Ping.ping(SPARK_IP, 1);
 
     // Update Arduino Cloud
-    sparkReachable = reachable;
+sparkReachable = reachable;
+
+if (reachable) {
+    sparkPingMs = static_cast<int>(Ping.averageTime());
+    int rssi = WiFi.RSSI();
+
+    sparkStatus =
+        String("ONLINE | Ping ") +
+        String(sparkPingMs) +
+        " ms | RSSI " +
+        String(rssi) +
+        " dBm";
 
     Serial.printf(
-        "SPARK STATUS: %s\n",
-        reachable ? "REACHABLE" : "NOT REACHABLE"
+        "SPARK STATUS: REACHABLE | Ping %d ms | RSSI %d dBm\n",
+        sparkPingMs,
+        rssi
     );
+} else {
+    sparkPingMs = -1;
+    sparkStatus = "OFFLINE | No ping reply";
+
+    Serial.println("SPARK STATUS: NOT REACHABLE");
+}
 
     // NEW: Stop the startup timer
     if (reachable && sparkTimerRunning) {
@@ -134,8 +151,9 @@ void checkSparkStatus() {
     
 
 void setup() {
-    digitalWrite(RELAY_PIN, LOW);
     pinMode(RELAY_PIN, OUTPUT);
+    digitalWrite(RELAY_PIN, LOW);
+    
 
     Serial.begin(9600);
     delay(1500);
@@ -194,30 +212,19 @@ void loop() {
 }
 
 void onPowerRequestChange() {
-
     if (!powerRequest) {
-        armed = true;
         return;
     }
 
-    if (!armed) {
-        powerRequest = false;
-        return;
-    }
-
-    armed = false;
-    powerRequest = false;
-
-    // Start timer if Spark is unreachable
     if (!sparkReachable) {
         sparkStartTime = millis();
         sparkTimerRunning = true;
-
         Serial.println("SPARK: Startup timer started");
     }
 
-    // Original relay operation
     digitalWrite(RELAY_PIN, HIGH);
     delay(300);
     digitalWrite(RELAY_PIN, LOW);
+
+    powerRequest = false;
 }
