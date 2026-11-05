@@ -13,13 +13,24 @@ void onPowerRequestChange();
 
 bool powerRequest;
 bool sparkReachable;  //Spark's network status
+String sparkStatus;
+int sparkPingMs = -1;
 
-void initProperties(){
-
+void initProperties() {
   ArduinoCloud.setBoardId(DEVICE_LOGIN_NAME);
   ArduinoCloud.setSecretDeviceKey(DEVICE_KEY);
-  ArduinoCloud.addProperty(powerRequest, READWRITE, ON_CHANGE, onPowerRequestChange);
-  ArduinoCloud.addProperty(sparkReachable, READ, ON_CHANGE);
+
+  ArduinoCloud.addProperty(
+      powerRequest, READWRITE, ON_CHANGE, onPowerRequestChange);
+
+  ArduinoCloud.addProperty(
+      sparkReachable, READ, ON_CHANGE);
+
+  ArduinoCloud.addProperty(
+      sparkStatus, READ, ON_CHANGE);
+
+  ArduinoCloud.addProperty(
+      sparkPingMs, READ, ON_CHANGE);
 }
 
 WiFiConnectionHandler ArduinoIoTPreferredConnection(SSID, PASS);
