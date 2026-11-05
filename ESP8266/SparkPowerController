@@ -1,9 +1,12 @@
+
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
+#include <time.h>
+#include <utility/time/TimeService.h>
 #include "arduino_secrets.h"
 #include "thingProperties.h"
 
-#define RELAY_PIN D1  // GPIO5; HIGH activates the relay.
+#define RELAY_PIN D1  // Existing GPIO5 wiring; HIGH activates the relay.
 
 bool armed = false;
 WiFiEventHandler wifiDisconnectHandler;
@@ -16,6 +19,34 @@ int matchingAccessPoints = 0;
 int32_t strongestSignal = -1000;
 int32_t strongestChannel = 0;
 uint8_t strongestSecurity = 0;
+bool clockWifiWasConnected = false;
+bool clockReportedReady = false;
+
+// Arduino Cloud uses this network clock instead of its blocking NTP
+// request. Return zero until SNTP has obtained a plausible current timestamp.
+unsigned long readNetworkTime() {
+    const time_t now = time(nullptr);
+    if (now <= 0) {
+        return 0;
+    }
+    const unsigned long utc = static_cast<unsigned long>(now);
+    return TimeServiceClass::isTimeValid(utc) ? utc : 0;
+}
+
+void serviceNetworkClock() {
+    const bool connected = WiFi.status() == WL_CONNECTED;
+    if (connected && !clockWifiWasConnected) {
+        configTime(0, 0, "time.arduino.cc", "pool.ntp.org", "time.nist.gov");
+        Serial.println("CLOCK: background NTP started; waiting for valid time.");
+    }
+    clockWifiWasConnected = connected;
+
+    const unsigned long utc = readNetworkTime();
+    if (utc != 0 && !clockReportedReady) {
+        clockReportedReady = true;
+        Serial.printf("CLOCK: synchronized; UTC epoch=%lu.\n", utc);
+    }
+}
 
 void printScanSummary() {
     if (scanResult < 0) {
@@ -23,35 +54,29 @@ void printScanSummary() {
     } else if (matchingAccessPoints == 0) {
         Serial.println("WIFI SCAN: configured network NOT FOUND during startup scan.");
     } else {
-        Serial.printf(
-            "WIFI SCAN: configured network FOUND; matches=%d; "
-            "strongest RSSI=%ld dBm; channel=%ld; security=%u.\n",
-            matchingAccessPoints,
-            static_cast<long>(strongestSignal),
-            static_cast<long>(strongestChannel),
-            static_cast<unsigned int>(strongestSecurity)
-        );
+        Serial.printf("WIFI SCAN: configured network FOUND; matches=%d; "
+                      "strongest RSSI=%ld dBm; channel=%ld; security=%u.\n",
+                      matchingAccessPoints,
+                      static_cast<long>(strongestSignal),
+                      static_cast<long>(strongestChannel),
+                      static_cast<unsigned int>(strongestSecurity));
     }
 }
 
 void reportWifi() {
-    printScanSummary();
-
-    Serial.printf(
-        "WIFI STATE: status=%d; last disconnect reason=%u; "
-        "disconnect events=%lu.\n",
-        static_cast<int>(WiFi.status()),
-        static_cast<unsigned int>(lastDisconnectReason),
-        static_cast<unsigned long>(disconnectCount)
-    );
-
+    Serial.printf("WIFI STATE: status=%d; last disconnect reason=%u; "
+                  "disconnect events=%lu.\n",
+                  static_cast<int>(WiFi.status()),
+                  static_cast<unsigned int>(lastDisconnectReason),
+                  static_cast<unsigned long>(disconnectCount));
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf(
-            "WIFI CONNECTED: RSSI=%ld dBm; channel=%ld.\n",
-            static_cast<long>(WiFi.RSSI()),
-            static_cast<long>(WiFi.channel())
-        );
+        Serial.printf("WIFI CONNECTED: RSSI=%ld dBm; channel=%ld.\n",
+                      static_cast<long>(WiFi.RSSI()),
+                      static_cast<long>(WiFi.channel()));
     }
+    Serial.printf("CLOCK: %s; CLOUD: %s.\n",
+                  readNetworkTime() != 0 ? "valid" : "waiting for NTP",
+                  ArduinoCloud.connected() ? "connected" : "not connected");
 }
 
 void setup() {
@@ -60,17 +85,16 @@ void setup() {
 
     Serial.begin(9600);
     delay(1500);
-    Serial.println("\nSpark Arduino Cloud - WiFi diagnostics 1");
+    Serial.println("\nSpark Arduino Cloud - background clock 2");
+    Serial.println("WIFI: scanning from the ESP's installed location.");
 
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
-
     scanResult = WiFi.scanNetworks(false, true);
-
     for (int i = 0; i < scanResult; ++i) {
+        // Only report the configured network, not neighboring network names.
         if (WiFi.SSID(i) == SSID) {
             ++matchingAccessPoints;
-
             if (WiFi.RSSI(i) > strongestSignal) {
                 strongestSignal = WiFi.RSSI(i);
                 strongestChannel = WiFi.channel(i);
@@ -78,47 +102,44 @@ void setup() {
             }
         }
     }
-
     WiFi.scanDelete();
     printScanSummary();
 
+    // Store only the reason/counter in the callback. Print later in loop().
+    // Register after the scan so startup scan/mode changes aren't counted.
     wifiDisconnectHandler = WiFi.onStationModeDisconnected(
         [](const WiFiEventStationModeDisconnected& event) {
             lastDisconnectReason = event.reason;
             ++disconnectCount;
-        }
-    );
+        });
 
     initProperties();
+    TimeService.setSyncFunction(readNetworkTime);
     ArduinoCloud.begin(ArduinoIoTPreferredConnection);
     setDebugMessageLevel(2);
     ArduinoCloud.printDebugInfo();
 }
 
 void loop() {
+    serviceNetworkClock();
     ArduinoCloud.update();
 
     const uint32_t events = disconnectCount;
-
     if (events != lastPrintedDisconnectCount) {
         lastPrintedDisconnectCount = events;
-
-        Serial.printf(
-            "WIFI DISCONNECT: reason=%u; events=%lu.\n",
-            static_cast<unsigned int>(lastDisconnectReason),
-            static_cast<unsigned long>(events)
-        );
+        Serial.printf("WIFI DISCONNECT: reason=%u; events=%lu.\n",
+                      static_cast<unsigned int>(lastDisconnectReason),
+                      static_cast<unsigned long>(events));
     }
-
     if (static_cast<uint32_t>(millis() - lastWifiReportAt) >= 10000) {
         lastWifiReportAt = millis();
         reportWifi();
     }
-
     delay(1);
 }
 
 void onPowerRequestChange() {
+    // Original behavior: must first receive an OFF command to arm.
     if (!powerRequest) {
         armed = true;
         return;
@@ -136,3 +157,4 @@ void onPowerRequestChange() {
     delay(300);
     digitalWrite(RELAY_PIN, LOW);
 }
+
